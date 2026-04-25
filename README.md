@@ -2,61 +2,168 @@
 Python script 
 
 
-import pandas as pd
+from pathlib import Path
+import re
+import sys
 import unicodedata
 
+import numpy as np
+import pandas as pd
 
-### Cargar Excel
-df = pd.read_excel("VariasEmpresas_KPI´S_Todos_03_2026.xlsx", engine="openpyxl")
 
----
-### 1️⃣ Eliminar filas con "1001" o "Totales" en columna A
-df = df[~df['A'].isin(["1001", "Totales"])]
+BASE_DIR = Path(__file__).resolve().parent
 
----
-### 2️⃣ Reemplazar 1912 y 2281 → 24
-df['A'] = df['A'].replace({"1912": "24", "2281": "24"})
 
----
-### 3️⃣ Eliminar filas donde la columna N contiene "No cotiza S.S."
-df = df[df['N'] != "No cotiza S.S."]
+def resolver_ruta_entrada():
+    if len(sys.argv) < 2:
+        raise SystemExit("Uso: python LIMPIEZA_DATOS.py <archivo_excel>")
 
----
-### Si columna I contiene "Baja por fusión absorción empresa"
-# → vaciar columnas H e I
+    ruta = Path(sys.argv[1])
+    if not ruta.is_absolute():
+        ruta = BASE_DIR / ruta
 
-mask_fusion = df['I'] == "Baja por fusión absorción empresa"
-df.loc[mask_fusion, ['H', 'I']] = ""
+    if not ruta.exists():
+        raise FileNotFoundError(f"No existe el archivo de entrada: {ruta}")
 
----
-### 5️⃣ Si H tiene fecha y I está vacía → borrar contenido de H
-# -------------------------------------------------------------------
-mask_fecha_h = pd.to_datetime(df['H'], errors='coerce').notna()
-mask_i_vacio = df['I'].isna() | (df['I'].astype(str).str.strip() == "")
+    return ruta
 
-df.loc[mask_fecha_h & mask_i_vacio, 'H'] = ""
 
----
-### 6️⃣ Convertir formato de fecha F, G, J → YYYY-MM-DD
-for col in ['F', 'G', 'J']:
-    df[col] = pd.to_datetime(df[col], errors='coerce').dt.strftime("%Y-%m-%d")
+def construir_ruta_salida(ruta_entrada):
+    output_dir = ruta_entrada.parent / "SQL"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir / f"{ruta_entrada.stem}.csv"
 
----
-### 7️⃣ Eliminar acentos y la "ü" en todo el DataFrame
-def quitar_acentos(texto):
-    if isinstance(texto, str):
-        # Normalizar → eliminar tildes y diéresis
-        texto = unicodedata.normalize('NFKD', texto)
-        texto = texto.encode('ascii', 'ignore').decode('ascii')
+
+def quitar_acentos(valor):
+    if pd.isna(valor):
+        return valor
+
+    if not isinstance(valor, str):
+        return valor
+
+    resultado = []
+    for caracter in unicodedata.normalize("NFD", valor):
+        if caracter == "ñ":
+            resultado.append("ñ")
+        elif caracter == "Ñ":
+            resultado.append("Ñ")
+        elif unicodedata.category(caracter) != "Mn":
+            resultado.append(caracter)
+
+    return "".join(resultado)
+
+
+def limpiar_cabecera(valor):
+    if pd.isna(valor):
+        return ""
+
+    texto = str(valor).strip()
+    texto = quitar_acentos(texto)
+    texto = re.sub(r"[^0-9A-Za-zñÑ]+", "_", texto)
+    texto = re.sub(r"_+", "_", texto).strip("_")
     return texto
 
-df = df.applymap(quitar_acentos)
 
----
-### 8️⃣ En la fila 1 (cabeceras), sustituir espacios por "_"
-df.columns = [col.replace(" ", "_") for col in df.columns]
+def detectar_fila_cabecera(ruta_excel):
+    preview = pd.read_excel(ruta_excel, engine="openpyxl", header=None, nrows=10)
 
----
+    for indice, fila in preview.iterrows():
+        valores = [limpiar_cabecera(valor) for valor in fila.tolist()]
+        if "Empresa" in valores and "Nombre_empleado" in valores:
+            return indice
+
+    raise ValueError("No se ha encontrado la fila de cabeceras en el Excel")
+
+
+# === Cargar Excel ============================================================
+INPUT_FILE = resolver_ruta_entrada()
+OUTPUT_FILE = construir_ruta_salida(INPUT_FILE)
+
+header_row = detectar_fila_cabecera(INPUT_FILE)
+df = pd.read_excel(INPUT_FILE, engine="openpyxl", header=header_row)
+
+# 0️⃣ Limpiar cabeceras
+df.columns = [limpiar_cabecera(col) for col in df.columns]
+
+columnas_requeridas = [
+    "Empresa",
+    "Cotizacion_seguridad_soci",
+    "Causa_de_la_baja",
+    "Fecha_baja",
+    "Fecha_alta",
+    "Fecha_nacimiento",
+    "Fecha_antiguedad",
+]
+
+faltantes = [col for col in columnas_requeridas if col not in df.columns]
+if faltantes:
+    raise ValueError(
+        f"Faltan columnas requeridas: {faltantes}. "
+        f"Columnas detectadas: {df.columns.tolist()}"
+    )
+
+# 1️⃣ Eliminar empresas no válidas
+df = df[~df["Empresa"].astype(str).str.strip().isin(["1001", "Totales"])]
+
+# 2️⃣ Normalizar códigos de empresa
+df["Empresa"] = df["Empresa"].astype(str).str.strip().replace(
+    {"1912": "24", "2281": "24"}
+)
+
+# 3️⃣ Eliminar empleados que no cotizan
+df = df[
+    df["Cotizacion_seguridad_soci"].astype(str).str.strip() != "No cotiza S.S."
+]
+
+# 4️⃣ Baja por fusión → limpiar datos de baja
+mask_fusion = (
+    df["Causa_de_la_baja"].astype(str).str.strip()
+    == "Baja por fusión absorción empresa"
+)
+df.loc[mask_fusion, ["Fecha_baja", "Causa_de_la_baja"]] = np.nan
+
+# 5️⃣ Fecha de baja sin causa → eliminar fecha
+mask_fecha_baja = pd.to_datetime(df["Fecha_baja"], errors="coerce").notna()
+mask_causa_vacia = df["Causa_de_la_baja"].isna() | (
+    df["Causa_de_la_baja"].astype(str).str.strip() == ""
+)
+df.loc[mask_fecha_baja & mask_causa_vacia, "Fecha_baja"] = np.nan
+
+# 6️⃣ Normalizar fechas
+for col in [
+    "Fecha_alta",
+    "Fecha_nacimiento",
+    "Fecha_antiguedad",
+    "Fecha_baja",
+]:
+    df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%Y/%m/%d")
+
+# 7️⃣ Eliminar acentos (conservando ñ)
+df = df.map(quitar_acentos)
+
+# 8️⃣ Convertir columnas numéricas a enteros
+columnas_enteras = [
+    "Empleado_Codigo",
+    "Dias_alta_en_la_empresa_p",
+    "Tarifa",
+    "Codigo_categoria",
+    "Codigo_contrato",
+    "Dias_percepcion_I_T",
+    "Dias_accidente",
+]
+
+for col in columnas_enteras:
+    if col in df.columns:
+        serie = pd.to_numeric(df[col], errors="coerce")
+        df[col] = serie.map(
+            lambda valor: "" if pd.isna(valor) else str(int(valor))
+        )
+
+# === Exportar CSV ============================================================
+df.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
+
+print(f"OK: archivo generado en {OUTPUT_FILE}")
+
 ### Guardar resultado final
 df.to_excel("VariasEmpresas_KPI´S_Todos_03_2026_PROCESADO.xlsx", index=False, engine="openpyxl"
 
